@@ -37,6 +37,46 @@ from api.models.cmdb import PreferenceShowAttributes
 from api.models.cmdb import PreferenceTreeView
 
 
+def _topo_flatten_lenient(topo):
+    """toposort_flatten 的容环版本:类型关系允许自关联和双向边后,拓扑视图可能选中含环的边集合;
+    存在环时按 Kahn 顺序输出,卡住的环上节点以稳定顺序逐个兜底,避免视图渲染报错。"""
+    try:
+        return list(toposort.toposort_flatten(topo))
+    except toposort.CircularDependencyError:
+        nodes = set(topo)
+        for _parents in topo.values():
+            nodes |= _parents
+        order, emitted, pending = [], set(), set(nodes)
+        while pending:
+            ready = sorted(n for n in pending if not (topo.get(n, set()) - emitted))
+            if not ready:
+                ready = [min(pending)]  # 剩余节点相互成环,取一个稳定输出
+            for n in ready:
+                order.append(n)
+                emitted.add(n)
+                pending.discard(n)
+        return order
+
+
+def _topo_levels_lenient(topo):
+    """toposort 的容环版本:环内节点无合法分层时逐个退化输出,保证视图渲染不中断。"""
+    try:
+        return [list(group) for group in toposort.toposort(topo)]
+    except toposort.CircularDependencyError:
+        nodes = set(topo)
+        for _parents in topo.values():
+            nodes |= _parents
+        levels, emitted, pending = [], set(), set(nodes)
+        while pending:
+            ready = {n for n in pending if not (topo.get(n, set()) - emitted)}
+            if not ready:
+                ready = {min(pending)}  # 环上取一个节点逐层解开,避免死循环
+            levels.append(sorted(ready))
+            emitted |= ready
+            pending -= ready
+        return levels
+
+
 class PreferenceManager(object):
     pref_attr_cls = PreferenceShowAttributes
     pref_tree_cls = PreferenceTreeView
@@ -380,26 +420,29 @@ class PreferenceManager(object):
                 id2type[i['parent_id']] = None
                 id2type[i['child_id']] = None
             topo = {i['child_id']: {i['parent_id']} for i in view2cr_ids[view_name]}
-            leaf = list(set(toposort.toposort_flatten(topo)) - set([j for i in topo.values() for j in i]))
+            leaf = list(set(_topo_flatten_lenient(topo)) - set([j for i in topo.values() for j in i]))
 
             leaf2show_types = {i: [t['child_id'] for t in CITypeRelation.get_by(parent_id=i)] for i in leaf}
             node2show_types = copy.deepcopy(leaf2show_types)
 
-            def _find_parent(_node_id):
+            def _find_parent(_node_id, _seen):
+                if _node_id in _seen:
+                    return
+                _seen = _seen | {_node_id}
                 parents = topo.get(_node_id, {})
                 for parent in parents:
                     node2show_types.setdefault(parent, []).extend(node2show_types.get(_node_id, []))
-                    _find_parent(parent)
+                    _find_parent(parent, _seen)
                 if not parents:
                     return
 
             for _l in leaf:
-                _find_parent(_l)
+                _find_parent(_l, set())
 
             for node_id in node2show_types:
                 node2show_types[node_id] = [CITypeCache.get(i).to_dict() for i in set(node2show_types[node_id])]
 
-            topo_flatten = list(toposort.toposort_flatten(topo))
+            topo_flatten = _topo_flatten_lenient(topo)
             level2constraint = {}
             for i, _ in enumerate(topo_flatten[1:]):
                 ctr = CITypeRelation.get_by(
@@ -412,7 +455,7 @@ class PreferenceManager(object):
                     child_id=leaf2show_types[topo_flatten[-1]][0], first=True, to_dict=False)
                 level2constraint[len(topo_flatten)] = ctr and ctr.constraint
 
-            result[view_name] = dict(topo=list(map(list, toposort.toposort(topo))),
+            result[view_name] = dict(topo=_topo_levels_lenient(topo),
                                      topo_flatten=topo_flatten,
                                      level2constraint=level2constraint,
                                      leaf=leaf,

@@ -879,8 +879,12 @@ class CITypeRelationManager(object):
         target_type_ids = map(int, target_type_ids)
 
         graph = nx.DiGraph()
+        visited = set()
 
         def get_children(_id, _graph):
+            if _id in visited:
+                return
+            visited.add(_id)
             children = CITypeRelation.get_by(parent_id=_id, to_dict=False)
 
             for i in children:
@@ -925,16 +929,18 @@ class CITypeRelationManager(object):
     def recursive_level2children(cls, parent_id):
         result = defaultdict(list)
 
-        def get_children(_id, level):
+        def get_children(_id, level, _path):
+            if _id in _path:
+                return
             children = CITypeRelation.get_by(parent_id=_id, to_dict=False)
             if children:
                 result[level + 1].extend([i.child.to_dict() for i in children])
 
             for i in children:
                 if i.child_id != _id:
-                    get_children(i.child_id, level + 1)
+                    get_children(i.child_id, level + 1, _path | {_id})
 
-        get_children(parent_id, 0)
+        get_children(parent_id, 0, set())
 
         return result
 
@@ -1027,17 +1033,7 @@ class CITypeRelationManager(object):
         p = CITypeManager.check_is_existed(parent)
         c = CITypeManager.check_is_existed(child)
 
-        rels = defaultdict(set)
-        for i in CITypeRelation.get_by(to_dict=False):
-            rels[i.child_id].add(i.parent_id)
-        rels[c.id].add(p.id)
-
-        try:
-            toposort_flatten(rels)
-        except toposort.CircularDependencyError as e:
-            current_app.logger.warning(str(e))
-            return abort(400, ErrFormat.circular_dependency_error)
-
+        # 类型关系允许自关联与双向边(环):实例级关系不校验环,此处不再要求类型图为 DAG
         old_parent_attr_ids, old_child_attr_ids = None, None
         existed = cls._get(p.id, c.id)
         if existed is not None:
